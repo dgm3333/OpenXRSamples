@@ -11,7 +11,8 @@
 #include <d3dcompiler.h> // For compiling shaders! D3DCompile
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-
+#include "iostream"
+#include <string>
 #include <thread> // sleep_for
 #include <vector>
 #include <algorithm> // any_of
@@ -20,6 +21,11 @@ using namespace std;
 using namespace DirectX; // Matrix math
 
 ///////////////////////////////////////////
+
+struct Result {
+	std::string error;
+	bool ok;
+};
 
 struct swapchain_surfdata_t {
 	ID3D11DepthStencilView *depth_view;
@@ -93,7 +99,7 @@ vector<XrView>                  xr_views;
 vector<XrViewConfigurationView> xr_config_views;
 vector<swapchain_t>             xr_swapchains;
 
-bool openxr_init          (const char *app_name, int64_t swapchain_format);
+Result openxr_init          (const char *app_name, int64_t swapchain_format);
 void openxr_make_actions  ();
 void openxr_shutdown      ();
 void openxr_poll_events   (bool &exit);
@@ -106,7 +112,7 @@ bool openxr_render_layer  (XrTime predictedTime, vector<XrCompositionLayerProjec
 
 ID3D11Device        *d3d_device        = nullptr;
 ID3D11DeviceContext *d3d_context       = nullptr;
-int64_t              d3d_swapchain_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+int64_t              d3d_swapchain_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
 bool                 d3d_init             (LUID &adapter_luid);
 void                 d3d_shutdown         ();
@@ -167,9 +173,11 @@ uint16_t app_inds[] = {
 ///////////////////////////////////////////
 
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
-	if (!openxr_init("Single file OpenXR", d3d_swapchain_fmt)) {
+// int main() {
+	Result result = openxr_init("Single file OpenXR", d3d_swapchain_fmt);
+	if (!result.ok) {
 		d3d_shutdown();
-		MessageBox(nullptr, "OpenXR initialization failed\n", "Error", 1);
+		MessageBox(nullptr, result.error.c_str(), "Error", 1);
 		return 1;
 	}
 	openxr_make_actions();
@@ -200,7 +208,7 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 // OpenXR code                           //
 ///////////////////////////////////////////
 
-bool openxr_init(const char *app_name, int64_t swapchain_format) {
+Result openxr_init(const char *app_name, int64_t swapchain_format) {
 	// OpenXR will fail to initialize if we ask for an extension that OpenXR
 	// can't provide! So we need to check our all extensions before 
 	// initializing OpenXR with them. Note that even if the extension is 
@@ -239,11 +247,13 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 	// If a required extension isn't present, you want to ditch out here!
 	// It's possible something like your rendering API might not be provided
 	// by the active runtime. APIs like OpenGL don't have universal support.
-	if (!std::any_of( use_extensions.begin(), use_extensions.end(), 
-		[] (const char *ext) {
-			return strcmp(ext, XR_KHR_D3D11_ENABLE_EXTENSION_NAME)==0;
-		}))
-		return false;
+	if (!std::any_of(use_extensions.begin(), use_extensions.end(),
+		[](const char* ext) {
+		return strcmp(ext, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0;
+	}))
+	{
+		return { "extension d3d11 is not present", false };
+	}
 
 	// Initialize OpenXR with the extensions we've found!
 	XrInstanceCreateInfo createInfo = { XR_TYPE_INSTANCE_CREATE_INFO };
@@ -255,8 +265,9 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 
 	// Check if OpenXR is on this system, if this is null here, the user 
 	// needs to install an OpenXR runtime and ensure it's active!
-	if (xr_instance == nullptr)
-		return false;
+	if (xr_instance == nullptr) {
+		return { "xr_instance is null", false };
+	}
 
 	// Load extension methods that we'll need for this application! There's a
 	// couple ways to do this, and this is a fairly manual one. Chek out this
@@ -305,18 +316,16 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 	systemInfo.formFactor = app_config_form;
 	xrGetSystem(xr_instance, &systemInfo, &xr_system_id);
 
-	// Check what blend mode is valid for this device (opaque vs transparent displays)
-	// We'll just take the first one available!
-	uint32_t blend_count = 0;
-	xrEnumerateEnvironmentBlendModes(xr_instance, xr_system_id, app_config_view, 1, &blend_count, &xr_blend);
-
 	// OpenXR wants to ensure apps are using the correct graphics card, so this MUST be called 
 	// before xrCreateSession. This is crucial on devices that have multiple graphics cards, 
 	// like laptops with integrated graphics chips in addition to dedicated graphics cards.
 	XrGraphicsRequirementsD3D11KHR requirement = { XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
-	ext_xrGetD3D11GraphicsRequirementsKHR(xr_instance, xr_system_id, &requirement);
+	XrResult result = ext_xrGetD3D11GraphicsRequirementsKHR(xr_instance, xr_system_id, &requirement);
+	if (result != XR_SUCCESS) {
+		return { "requiremets failed with code" + std::to_string(result), false};
+	}
 	if (!d3d_init(requirement.adapterLuid))
-		return false;
+		return { "requiremets failed", false };
 
 	// A session represents this application's desire to display things! This is where we hook up our graphics API.
 	// This does not start the session, for that, you'll need a call to xrBeginSession, which we do in openxr_poll_events
@@ -329,7 +338,12 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 
 	// Unable to start a session, may not have an MR device attached or ready
 	if (xr_session == nullptr)
-		return false;
+		return { "xr_session is null", false };
+
+	// Check what blend mode is valid for this device (opaque vs transparent displays)
+	// We'll just take the first one available!
+	uint32_t blend_count = 0;
+	xrEnumerateEnvironmentBlendModes(xr_instance, xr_system_id, app_config_view, 1, &blend_count, &xr_blend);
 
 	// OpenXR uses a couple different types of reference frames for positioning content, we need to choose one for
 	// displaying our content! STAGE would be relative to the center of your guardian system's bounds, and LOCAL
@@ -361,15 +375,21 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 		swapchain_info.mipCount    = 1;
 		swapchain_info.faceCount   = 1;
 		swapchain_info.format      = swapchain_format;
-		swapchain_info.width       = view.recommendedImageRectWidth;
+		swapchain_info.width       = view.recommendedImageRectWidth; // *2 cause it's stereo?
 		swapchain_info.height      = view.recommendedImageRectHeight;
 		swapchain_info.sampleCount = view.recommendedSwapchainSampleCount;
 		swapchain_info.usageFlags  = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-		xrCreateSwapchain(xr_session, &swapchain_info, &handle);
+		XrResult result_create_swapchain = xrCreateSwapchain(xr_session, &swapchain_info, &handle);
+		if (result_create_swapchain != XrResult::XR_SUCCESS) {
+			return Result{ "error creating swapchain", false };
+		}
 
 		// Find out how many textures were generated for the swapchain
 		uint32_t surface_count = 0;
-		xrEnumerateSwapchainImages(handle, 0, &surface_count, nullptr);
+		XrResult result_enum_swapchains = xrEnumerateSwapchainImages(handle, 0, &surface_count, nullptr);
+		if (result_enum_swapchains != XrResult::XR_SUCCESS) {
+			return Result{ "error enumerating swapchains to check surface count", false };
+		}
 
 		// We'll want to track our own information about the swapchain, so we can draw stuff onto it! We'll also create
 		// a depth buffer for each generated texture here as well with make_surfacedata.
@@ -386,7 +406,7 @@ bool openxr_init(const char *app_name, int64_t swapchain_format) {
 		xr_swapchains.push_back(swapchain);
 	}
 
-	return true;
+	return { "", true };
 }
 
 ///////////////////////////////////////////
